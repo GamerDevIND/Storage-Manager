@@ -69,8 +69,13 @@ class Logger:
         async with cls._get_async_lock():
             if stdout:
                 print(formatted)
+            if not aiof:
+                cls._write_file_sync(formatted, append)
             if save_to_file:
-                await asyncio.to_thread(cls._write_file_sync, formatted, append)
+                os.makedirs(cls.log_dir, exist_ok=True)
+                mode = "a" if append else "w"
+                async with aiofiles.open(cls.log_file, mode, encoding="utf-8") as f:
+                    await f.write(formatted)
 
     @classmethod
     def debug_sync(cls, *msg):
@@ -111,7 +116,6 @@ class Logger:
     @classmethod
     async def warn_async(cls, *msg: str) -> None:
         await cls.log_async(" ".join(msg), "warn")
-
 @dataclass
 class File:
     file_name: str
