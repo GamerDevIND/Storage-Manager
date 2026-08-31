@@ -69,9 +69,11 @@ class Logger:
         async with cls._get_async_lock():
             if stdout:
                 print(formatted)
-            if not aiof:
-                cls._write_file_sync(formatted, append)
+                
             if save_to_file:
+                if not aiof:
+                    cls._write_file_sync(formatted, append)
+                    return 
                 os.makedirs(cls.log_dir, exist_ok=True)
                 mode = "a" if append else "w"
                 async with aiofiles.open(cls.log_file, mode, encoding="utf-8") as f:
