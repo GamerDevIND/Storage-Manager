@@ -38,11 +38,12 @@ class Logger:
     @classmethod
     def _format_message(cls, message: str, level: str) -> str:
         timestamp = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
-        emoji = {
+        emoji: str = {
             "info": "ℹ️",
             "warn": "⚠️",
             "error": "🟥",
-            "success": "✅"
+            "success": "✅",
+            'debug': "🛠",
         }.get(level.lower().strip(), "📋")
         return f"{emoji} [{level.upper().strip()}] {message} - [{timestamp}]\n"
 
@@ -71,7 +72,14 @@ class Logger:
             if save_to_file:
                 await asyncio.to_thread(cls._write_file_sync, formatted, append)
 
-    # Short helper aliases
+    @classmethod
+    def debug_sync(cls, *msg):
+        cls.log_sync(" ".join(msg), "debug")
+
+    @classmethod
+    async def debug_async(cls, *msg):
+        await cls.log_async(" ".join(msg), "debug")
+
     @classmethod
     def info_sync(cls, *msg: str) -> None:
         cls.log_sync(" ".join(msg), "info")
