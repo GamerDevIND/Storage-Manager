@@ -1,3 +1,4 @@
+from sqlite3 import Row
 from typing import Callable
 from utils import Logger, Blob, call_async
 import asyncio
@@ -10,6 +11,9 @@ from hashlib import sha256
 from pathlib import Path
 
 class LocalProvider:
+    GC_INTERVAL_SECONDS = 60 * 60
+    GC_GRACE_SECONDS = 60
+
     def __init__(self, main_dir = './storage') -> None:
         self.main_dir = main_dir
 
@@ -20,63 +24,87 @@ class LocalProvider:
         self.blobs_dir = os.path.abspath(os.path.join(main_dir, 'blobs/'))
         os.makedirs(self.blobs_dir, exist_ok=True)
         self.db_lock = asyncio.Lock()
-        self.conn = None
+        self.conn: aiosqlite.Connection | None = None
+        self.gc_task: asyncio.Task | None = None
 
     async def gc(self):
         root = Path(self.blobs_dir).resolve()
-        dirs = [p for p in root.iterdir() if p.is_dir()]
-        files = [p for p in root.iterdir() if p.is_file()]
+        if self.conn is None:
+            raise RuntimeError('Local provider must be initialized before garbage collection')
 
-        async def walk(root: Path):
-            collected: list[Path] = []
-            for dirpath, _dirnames, filenames in os.walk(root):
-                for fname in filenames:
-                    collected.append(Path(os.path.join(dirpath, fname)).resolve())
-            return collected
+        def walk_error(error: OSError):
+            raise error
 
-        p = list(files)
-        for dir in dirs:
-            p.extend(await walk(dir))
+        def find_old_files() -> list[Path]:
+            candidates: list[Path] = []
+            now = time.time()
+            for dirpath, dirnames, filenames in os.walk(root, onerror=walk_error, followlinks=False):
+                dirnames[:] = [
+                    dirname for dirname in dirnames
+                    if not Path(dirpath, dirname).is_symlink()
+                ]
+                for filename in filenames:
+                    path = Path(dirpath, filename)
+                    if path.is_symlink():
+                        continue
+                    try:
+                        modified_at = path.stat().st_mtime
+                    except FileNotFoundError:
+                        continue
+                    if now - modified_at >= self.GC_GRACE_SECONDS:
+                        candidates.append(path)
+            return candidates
 
-        now = time.time()
-        grace = 60
-        safe_paths = []
-        for path in p:
+        candidates = await asyncio.to_thread(find_old_files)
+        result:None | list[Row] = await self.exec('SELECT file_path FROM blobs', get='all') # type: ignore
+        if result is None:
+            raise RuntimeError('Unable to read indexed blob paths during garbage collection')
+
+        indexed_paths = {
+            os.path.normcase(os.path.abspath(row[0]))
+            for row in result
+        }
+        for path in candidates:
+            path_string = os.path.normcase(os.path.abspath(path))
+            if path_string in indexed_paths:
+                continue
             try:
-                stat = await asyncio.to_thread(os.stat, path)
-                if now - stat.st_mtime < grace:
+                modified_at = await asyncio.to_thread(lambda: path.stat().st_mtime)
+                if time.time() - modified_at < self.GC_GRACE_SECONDS:
                     continue
-            except Exception:
-                pass
-            safe_paths.append(str(path))
+                await asyncio.to_thread(path.unlink)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                await Logger.error_async(f'[DB ({self.name})] An error occured trying GC delete path: "{path}": {repr(e)}; Skipping')
 
-        q = 'SELECT file_path FROM blobs'
-        result = await self.exec(q, get='all')
-        rows = result if isinstance(result, list) else []
-        rows = {str(Path(row[0]).resolve()) for row in rows}
-        for path in safe_paths:
-            if path not in rows:
-                try:
-                    await asyncio.to_thread(os.remove, path)
-                except Exception as e:
-                    await Logger.error_async(f'[DB ({self.name})] An error occured trying GC delete path: "{path}": {repr(e)}; Skipping')
+    async def _gc_loop(self):
+        while True:
+            try:
+                await self.gc()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                await Logger.error_async(f'[DB ({self.name})] Garbage collection failed: {repr(e)}')
+            await asyncio.sleep(self.GC_INTERVAL_SECONDS)
 
     async def exec(self, cmd: str, args:list | tuple = tuple(), get: None | str = None, sql_script: bool = False, commit_to_db: bool = True):
-            args = tuple(args)
-            if not self.conn:
+        args = tuple(args)
+        async with self.db_lock:
+            conn = self.conn
+            if conn is None:
                 await Logger.warn_async(f'[DB ({self.name})] Index database not initalised please do so by calling and awaiting `init()`')
                 return
-            
-            async with self.db_lock:
-                cursor = await self.conn.cursor()
-                if sql_script:
-                    await cursor.executescript(cmd)
-                else:
-                    await cursor.execute(cmd, tuple(args))
-    
+
+            cursor = await conn.cursor()
+            if sql_script:
+                await cursor.executescript(cmd)
+            else:
+                await cursor.execute(cmd, args)
+
             if commit_to_db:
-                await self.conn.commit()
-    
+                await conn.commit()
+
             if get:
                 get = get.strip().lower() 
                 if get == 'cursor':
@@ -89,12 +117,24 @@ class LocalProvider:
                     return list(await cursor.fetchall())
                 else:
                     await Logger.error_async(f"[DB ({self.name})] Invalid get parameter: {get} for DB queries.")
-        
+
     async def init(self,):
+        if self.conn is not None:
+            await Logger.warn_async(f'[DB ({self.name})] Index database is already initialized')
+            return
+
         self.conn = await aiosqlite.connect(self.db_path)
-        await self.conn.execute("PRAGMA journal_mode=WAL;")
-        await self.create_tables()
+        try:
+            await self.conn.execute("PRAGMA journal_mode=WAL;")
+            await self.create_tables()
+        except BaseException:
+            conn = self.conn
+            self.conn = None
+            if conn is not None:
+                await conn.close()
+            raise
         await Logger.success_async(f'[DB ({self.name})] Index database successfully initilaised')
+        self.gc_task = asyncio.create_task(self._gc_loop())
 
     async def verify_blob(self, blob_hash, size, status, delete_bad, read_verify, stored_blob_hash):
         q = 'SELECT file_path from blobs WHERE blob_hash = ?'
@@ -102,7 +142,7 @@ class LocalProvider:
             await Logger.warn_async(f'[DB ({self.name})] Index database not initalised please do so by calling and awaiting `init()`')
             return False
 
-        row = await self.exec(q, [blob_hash], get='one')
+        row: None | Row = await self.exec(q, [blob_hash], get='one') # type: ignore
         if not row or not row[0]:
             return False
 
@@ -161,12 +201,11 @@ class LocalProvider:
 
     async def verify(self, read_verify = False, delete_bad = True):
         q = "SELECT blob_hash, stored_blob_hash, size, status from blobs"
-        await self.exec(q)
         if not self.conn:
             await Logger.warn_async(f'[DB ({self.name})] Index database not initalised please do so by calling and awaiting `init()`')
             return
         
-        rows = list(await self.exec(q, get='all'))
+        rows:list[Row] = await self.exec(q, get='all') # type: ignore
         total_blobs = len(rows)
         for i, row in enumerate(rows, 1):
             await Logger.info_async(f'[DB ({self.name})] Verifying {i} / {total_blobs} blob...')
@@ -179,13 +218,22 @@ class LocalProvider:
         await Logger.success_async(f'[DB ({self.name})] Verification completed.')
 
     async def close(self):
-        if not self.conn:
-            await Logger.warn_async(f'[DB ({self.name})] Index database not initalised please do so by calling and awaiting `init()`')
-            return
-        
-        async with self.db_lock:
-            await self.conn.commit()
-            await self.conn.close()
+        gc_task = self.gc_task
+        self.gc_task = None
+        try:
+            if gc_task is not None:
+                gc_task.cancel()
+                try:
+                    await gc_task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            async with self.db_lock:
+                conn = self.conn
+                if conn is not None:
+                    await conn.commit()
+                    await conn.close()
+                    self.conn = None
         await Logger.success_async(f'[DB ({self.name})] Index database successfully closed')
 
     async def create_tables(self):
@@ -233,7 +281,7 @@ class LocalProvider:
                 if not self.conn:
                     await Logger.warn_async(f'[DB ({self.name})] Index database or cursor not initalised please do so by calling and awaiting `init()`')
                 else:
-                    row = await self.exec(q, (blob_hash,), get='one')
+                    row: None | Row = await self.exec(q, (blob_hash,), get='one') # type: ignore
                     if row and row[0]:
                         if row[0] == r:
                             await Logger.info_async(f'[DB ({self.name})] {blob_hash} already exists on: "{file_path}"; Skipping write...')
@@ -276,7 +324,7 @@ class LocalProvider:
             blob_hash = blob_hash.blob_hash
 
         await Logger.info_async(f'[DB ({self.name})] Attempting to retrieve blob: {blob_hash}')
-        row = await self.exec("SELECT file_path FROM blobs WHERE blob_hash = ?", (blob_hash,), get='one')
+        row: None | Row = await self.exec("SELECT file_path FROM blobs WHERE blob_hash = ?", (blob_hash,), get='one') # type: ignore
 
         if not row or not os.path.exists(row[0]):
             await Logger.warn_async(f'[DB ({self.name})] {blob_hash} does not exist in the file system. Attempting recovery...')
@@ -315,7 +363,7 @@ class LocalProvider:
             SELECT file_path FROM blobs WHERE blob_hash = ?
         '''.strip()
 
-        row = await self.exec(q, [blob_hash], get='one')
+        row:None | Row = await self.exec(q, [blob_hash], get='one') # type: ignore
 
         if not row or not os.path.exists(row[0]):
             await Logger.error_async(f'[DB ({self.name})] {blob_hash} does not exist in the file system. Aborting...')

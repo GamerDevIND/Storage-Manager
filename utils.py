@@ -118,6 +118,7 @@ class Logger:
     @classmethod
     async def warn_async(cls, *msg: str) -> None:
         await cls.log_async(" ".join(msg), "warn")
+
 @dataclass
 class File:
     file_name: str

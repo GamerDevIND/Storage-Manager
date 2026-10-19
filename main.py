@@ -25,16 +25,15 @@ class FileManager:
         Logger._get_async_lock(True)
 
     async def _gc_blob(self):
-        while 1:
+        while True:
             try:
                 await self.index_manager.garbage_collect(self.provider.delete_blob)
-                await asyncio.sleep(60 * 60)
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as e:
                 e = repr(e)
                 await Logger.error_async(f'GC Task had an error: {e}')
-                break
+            await asyncio.sleep(60 * 60)
 
     async def init(self, cdc_min_size: int = 1024 * 256, cdc_avg_size: int = 1024 * 1024, cdc_max_size: int = 1024 * 1024 * 4,):
         await self.index_manager.init()
@@ -55,16 +54,20 @@ class FileManager:
         self.gc_task = asyncio.create_task(self._gc_blob())
 
     async def close(self):
-        await self.provider.close()
-        if self.gc_task:
+        gc_task = self.gc_task
+        self.gc_task = None
+        try:
+            if gc_task:
+                gc_task.cancel()
+                try:
+                    await gc_task
+                except asyncio.CancelledError:
+                    await Logger.success_async('Blob garbage collection task closed successfully.')
+        finally:
             try:
-                self.gc_task.cancel()
-                await self.gc_task
-            except asyncio.CancelledError:
-                pass
-            if self.gc_task.cancelled():
-                await Logger.success_async(f'Blob garbage collection task closed successfully.')
-        await self.index_manager.close()
+                await self.provider.close()
+            finally:
+                await self.index_manager.close()
         # await self.journal_manager.delete_journal()
 
     async def index_file(self, file_path:str, chunk_size_KB: int | float | None = 1024 * 10, metadata: dict | None = None, atomic_commit = True):
