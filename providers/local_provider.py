@@ -1,9 +1,10 @@
-from typing import Any, Callable
+from typing import Callable
 from utils import Logger, Blob, call_async
 import asyncio
 import os
 import aiosqlite
 import json
+import time
 import aiofiles
 from hashlib import sha256
 from pathlib import Path
@@ -21,7 +22,46 @@ class LocalProvider:
         self.db_lock = asyncio.Lock()
         self.conn = None
 
-    async def exec(self, cmd: str, args:list | tuple = tuple(), get: None | str = None, sql_script: bool = False, commit_to_db: bool = True) -> Any:
+    async def gc(self):
+        root = Path(self.blobs_dir).resolve()
+        dirs = [p for p in root.iterdir() if p.is_dir()]
+        files = [p for p in root.iterdir() if p.is_file()]
+
+        async def walk(root: Path):
+            collected: list[Path] = []
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for fname in filenames:
+                    collected.append(Path(os.path.join(dirpath, fname)).resolve())
+            return collected
+
+        p = list(files)
+        for dir in dirs:
+            p.extend(await walk(dir))
+
+        now = time.time()
+        grace = 60
+        safe_paths = []
+        for path in p:
+            try:
+                stat = await asyncio.to_thread(os.stat, path)
+                if now - stat.st_mtime < grace:
+                    continue
+            except Exception:
+                pass
+            safe_paths.append(str(path))
+
+        q = 'SELECT file_path FROM blobs'
+        result = await self.exec(q, get='all')
+        rows = result if isinstance(result, list) else []
+        rows = {str(Path(row[0]).resolve()) for row in rows}
+        for path in safe_paths:
+            if path not in rows:
+                try:
+                    await asyncio.to_thread(os.remove, path)
+                except Exception as e:
+                    await Logger.error_async(f'[DB ({self.name})] An error occured trying GC delete path: "{path}": {repr(e)}; Skipping')
+
+    async def exec(self, cmd: str, args:list | tuple = tuple(), get: None | str = None, sql_script: bool = False, commit_to_db: bool = True):
             args = tuple(args)
             if not self.conn:
                 await Logger.warn_async(f'[DB ({self.name})] Index database not initalised please do so by calling and awaiting `init()`')
@@ -44,9 +84,9 @@ class LocalProvider:
                 elif get in ['one', 'fetchone', 'fetch_one', 'fetch one']:
                     return await cursor.fetchone()
                 elif get in ['many', 'fetchmany', 'fetch_many', 'fetch many']:
-                    return await cursor.fetchmany()
+                    return list(await cursor.fetchmany())
                 elif get in ['all', 'fetchall', 'fetch_all', 'fetch all']:
-                    return await cursor.fetchall()
+                    return list(await cursor.fetchall())
                 else:
                     await Logger.error_async(f"[DB ({self.name})] Invalid get parameter: {get} for DB queries.")
         
@@ -176,7 +216,6 @@ class LocalProvider:
         blob_dir = os.path.join(self.blobs_dir, blob_hash[:2])
         os.makedirs(blob_dir, exist_ok=True)
         file_path = os.path.abspath(os.path.join(blob_dir, blob_hash))
-
         if isinstance(data, Blob):
             data = data.data or bytes()
 
@@ -200,6 +239,13 @@ class LocalProvider:
                             await Logger.info_async(f'[DB ({self.name})] {blob_hash} already exists on: "{file_path}"; Skipping write...')
                             return file_path
 
+        query = '''
+            INSERT INTO blobs (blob_hash, stored_blob_hash, size, file_path, metadata)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(blob_hash) DO UPDATE SET stored_blob_hash = excluded.stored_blob_hash, file_path = excluded.file_path, metadata = excluded.metadata;
+            '''
+        await self.exec(query, (blob_hash, post_processed_hash, len(data), file_path, json.dumps(metadata or {})))
+
         async def get_default_writer(data, file_path):
             if not data:
                 await Logger.warn_async(f'[DB ({self.name})] No data provided for "{file_path}"; aborting')
@@ -215,18 +261,11 @@ class LocalProvider:
         try:
             w = await call_async(writer(data = data, file_path = file_path))
 
-            status = 'ok'
+            q = "UPDATE blobs SET status = 'OK' WHERE blob_hash = ?"
         except Exception as e:
             await Logger.error_async(f'[DB ({self.name})] an error occured trying to save blob {blob_hash}: {repr(e)}')
-            status = 'corrupted'
-
-        query = '''
-            INSERT INTO blobs (blob_hash, stored_blob_hash, size, file_path, status, metadata)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(blob_hash) DO UPDATE SET stored_blob_hash = excluded.stored_blob_hash, file_path = excluded.file_path, 
-            status = excluded.status, metadata = excluded.metadata;
-        '''
-        await self.exec(query, (blob_hash, post_processed_hash, len(data), file_path, status.upper(), json.dumps(metadata or {})))
+            q = "DELETE FROM blobs WHERE blob_hash = ?"
+        await self.exec(q, [blob_hash])
         return file_path
 
     async def get_blob(self, blob_hash: str | Blob):
